@@ -198,30 +198,23 @@ def get_dataset_preprocessor(args, tokenizer_one, tokenizer_two):
 
     def preprocess_train(examples):
         all_pixel_values = []
-        images = [Image.open(io.BytesIO(im_bytes)).convert("RGB") for im_bytes in examples["jpg_0"]]
-        original_sizes = [(image.height, image.width) for image in images]
+        original_sizes = [(512, 512) for _ in range(len(examples))]
         crop_top_lefts = []
 
-        for col_name in ["jpg_0", "jpg_1"]:
-            images = [Image.open(io.BytesIO(im_bytes)).convert("RGB") for im_bytes in examples[col_name]]
-            if col_name == "jpg_1":
-                # Need to bring down the image to the same resolution.
-                # This seems like the simplest reasonable approach.
-                # "::-1" because PIL resize takes (width, height).
-                images = [image.resize(original_sizes[i][::-1]) for i, image in enumerate(images)]
-            pixel_values = [to_tensor(image) for image in images]
-            all_pixel_values.append(pixel_values)
+        for col_name in ["dalle_positive_imgs", "dalle_negative_imgs"]:
+            for i in range(len(examples[col_name][0])):
+                images = []
+                for img_list in examples[col_name]:
+                    images.append(img_list[i].convert("RGB"))
+            
+                pixel_values = [to_tensor(image) for image in images]
+                all_pixel_values.append(pixel_values)
 
         # Double on channel dim, jpg_y then jpg_w
         im_tup_iterator = zip(*all_pixel_values)
         combined_pixel_values = []
-        for im_tup, label_0 in zip(im_tup_iterator, examples["label_0"]):
+        for im_tup, caption in zip(im_tup_iterator, examples["caption"]):
             # Label noise.
-            if args.label_noise_prob is not None and random.random() < args.label_noise_prob:
-                label_0 = 1 - label_0
-
-            if label_0 == 0:
-                im_tup = im_tup[::-1]
 
             combined_im = torch.cat(im_tup, dim=0)  # no batch dim
 
@@ -299,3 +292,22 @@ def compute_loss(args, noise_scheduler, model_pred, target):
     # Full ORPO loss
     loss = model_losses_w.mean() - ratio_losses.mean()
     return loss, model_losses_w, model_losses_l, ratio_losses
+
+def compute_dpo_loss(args, model_pred, target, ref_pred):
+    model_losses = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+    model_losses = model_losses.mean(dim=list(range(1, len(model_losses.shape))))
+    model_losses_w, model_losses_l = model_losses.chunk(2)
+    
+    ref_losses = F.mse_loss(ref_pred.float(), target.float(), reduction="none")
+    ref_losses = ref_losses.mean(dim=list(range(1, len(ref_losses.shape))))
+    ref_losses_w, ref_losses_l = ref_losses.chunk(2)
+    
+    model_diff = model_losses_w - model_losses_l
+    ref_diff = ref_losses_w - ref_losses_l
+    
+    scale_term = -0.5 * args.beta_dpo
+    inside_term = scale_term * (model_diff - ref_diff)
+    implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
+    loss = -1 * F.logsigmoid(inside_term).mean()
+    
+    return loss, model_losses_w, model_losses_l, implicit_acc, ref_diff

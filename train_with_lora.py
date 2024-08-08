@@ -19,7 +19,7 @@ import math
 import os
 import shutil
 from pathlib import Path
-
+import random
 import torch
 import transformers
 from accelerate import Accelerator
@@ -31,7 +31,7 @@ from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
-
+import torch.nn.functional as F
 import diffusers
 from args import parse_args
 from diffusers import (
@@ -51,6 +51,7 @@ from utils import (
     get_wandb_url,
     import_model_class_from_model_name_or_path,
     log_validation,
+    compute_dpo_loss
 )
 
 
@@ -92,7 +93,7 @@ def main(args):
 
     # If passed along, set the training seed now.
     if args.seed is not None:
-        set_seed(args.seed)
+        set_seed(args.seed+accelerator.process_index)
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -149,13 +150,16 @@ def main(args):
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
-
+    if args.dpo_training:
+        ref_unet = UNet2DConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+        )
+        ref_unet.requires_grad_(False)
     # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
     unet.requires_grad_(False)
-
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -166,6 +170,8 @@ def main(args):
 
     # Move unet and text_encoders to device and cast to weight_dtype
     unet.to(accelerator.device, dtype=weight_dtype)
+    if args.dpo_training:
+        ref_unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
@@ -285,14 +291,6 @@ def main(args):
     preprocess_train_fn = get_dataset_preprocessor(args, tokenizer_one, tokenizer_two)
 
     with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            train_dataset = train_dataset.shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        if args.remove_ties:
-            train_dataset = train_dataset.filter(lambda example: example["label_0"] != example["label_1"])
-        else:
-            pass
-        # Set the training transforms
         train_dataset = train_dataset.with_transform(preprocess_train_fn)
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -385,13 +383,21 @@ def main(args):
     )
 
     unet.train()
+    implicit_acc_accumulated = 0.0
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 # (batch_size, 2*channels, h, w) -> (2*batch_size, channels, h, w)
-                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
-                feed_pixel_values = torch.cat(pixel_values.chunk(2, dim=1))
-
+                idx1 = random.randint(0, batch["pixel_values"].shape[1] // 6 - 1)
+                value_w = batch["pixel_values"][:, idx1 * 3 : (idx1 + 1) * 3, :, :].to(dtype=vae.dtype)
+                
+                if args.dpo_training or args.mapo_training:
+                    idx2 = random.randint(batch["pixel_values"].shape[1] // 6, batch["pixel_values"].shape[1] // 3 - 1)
+                    value_l = batch["pixel_values"][:, idx2 * 3 : (idx2 + 1) * 3, :, :].to(dtype=vae.dtype)
+                    feed_pixel_values = torch.cat((value_w, value_l), dim=0)
+                if args.sft_training:
+                    feed_pixel_values = value_w
+                
                 latents = []
                 for i in range(0, feed_pixel_values.shape[0], args.vae_encode_batch_size):
                     latents.append(
@@ -403,14 +409,21 @@ def main(args):
                     latents = latents.to(weight_dtype)
 
                 # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents).chunk(2)[0].repeat(2, 1, 1, 1)
+                noise = torch.randn_like(latents)
+                if args.dpo_training or args.mapo_training:
+                    noise = noise.chunk(2)[0].repeat(2, 1, 1, 1)
 
                 # Sample a random timestep for each image
-                bsz = latents.shape[0] // 2
+                bsz = latents.shape[0] 
+                if args.dpo_training or args.mapo_training:
+                    bsz = bsz // 2
+                
                 timesteps = torch.randint(
                     0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device, dtype=torch.long
-                ).repeat(2)
-
+                )
+                if args.dpo_training or args.mapo_training:
+                    timesteps = timesteps.repeat(2)
+                
                 # Add noise to the model input according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_model_input = noise_scheduler.add_noise(latents, noise, timesteps)
@@ -421,23 +434,33 @@ def main(args):
                         compute_time_ids(args, accelerator, weight_dtype, s, c)
                         for s, c in zip(batch["original_sizes"], batch["crop_top_lefts"])
                     ]
-                ).repeat(2, 1)
-
+                )
+                if args.dpo_training or args.mapo_training:
+                    add_time_ids = add_time_ids.repeat(2, 1)
+                
                 # Get the text embedding for conditioning
                 prompt_embeds, pooled_prompt_embeds = encode_prompt(
                     [text_encoder_one, text_encoder_two], [batch["input_ids_one"], batch["input_ids_two"]]
                 )
-                prompt_embeds = prompt_embeds.repeat(2, 1, 1)
-                pooled_prompt_embeds = pooled_prompt_embeds.repeat(2, 1)
+                if args.dpo_training or args.mapo_training:
+                    prompt_embeds = prompt_embeds.repeat(2, 1, 1)
+                    pooled_prompt_embeds = pooled_prompt_embeds.repeat(2, 1)
 
                 # Predict the noise residual
-                model_pred = unet(
-                    noisy_model_input,
-                    timesteps,
-                    prompt_embeds,
-                    added_cond_kwargs={"time_ids": add_time_ids, "text_embeds": pooled_prompt_embeds},
-                ).sample
-
+                with accelerator.autocast():
+                    model_pred = unet(
+                        noisy_model_input,
+                        timesteps,
+                        prompt_embeds,
+                        added_cond_kwargs={"time_ids": add_time_ids, "text_embeds": pooled_prompt_embeds},
+                    ).sample
+                    if args.dpo_training:
+                        ref_pred = ref_unet(
+                            noisy_model_input,
+                            timesteps,
+                            prompt_embeds,
+                            added_cond_kwargs={"time_ids": add_time_ids, "text_embeds": pooled_prompt_embeds},
+                        ).sample
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
@@ -446,11 +469,20 @@ def main(args):
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                # Full ORPO loss
-                loss, model_losses_w, model_losses_l, ratio_losses = compute_loss(
-                    args=args, noise_scheduler=noise_scheduler, model_pred=model_pred, target=target
-                )
-
+                if args.sft_training:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                elif args.dpo_training:
+                    loss, model_losses_w, model_losses_l, implicit_acc, ref_diff = compute_dpo_loss(
+                        args=args, model_pred=model_pred, target=target, ref_pred=ref_pred
+                    )
+                    avg_acc = accelerator.gather(implicit_acc).mean().detach().item()
+                    implicit_acc_accumulated += avg_acc / args.gradient_accumulation_steps
+                elif args.mapo_training:
+                    loss, model_losses_w, model_losses_l, ratio_losses = compute_loss(
+                        args=args, noise_scheduler=noise_scheduler, model_pred=model_pred, target=target
+                    )
+                else:
+                    ValueError("Unknown training type")
                 # Backprop.
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -494,23 +526,41 @@ def main(args):
                         log_validation(
                             args, unet=unet, vae=vae, accelerator=accelerator, weight_dtype=weight_dtype, epoch=epoch
                         )
-
-            logs = {
-                "epoch": args.num_train_epochs * progress_bar.n / args.max_train_steps,
-                "total loss": loss.detach().item(),
-                "Win Score": ((args.snr_value * model_losses_w) / (torch.exp(args.snr_value * model_losses_w) - 1))
-                .mean()
-                .detach()
-                .item(),
-                "Lose Score": ((args.snr_value * model_losses_l) / (torch.exp(args.snr_value * model_losses_l) - 1))
-                .mean()
-                .detach()
-                .item(),
-                "lr": lr_scheduler.get_last_lr()[0],
-                "OR loss": -ratio_losses.mean().detach().item(),
-                "model_losses_w": model_losses_w.mean().detach().item(),
-                "model_losses_l": model_losses_l.mean().detach().item(),
-            }
+            if args.sft_training:
+                logs = {
+                    "epoch": args.num_train_epochs * progress_bar.n / args.max_train_steps,
+                    "total loss": loss.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0],
+                }
+            elif args.dpo_training:
+                logs = {
+                    "epoch": args.num_train_epochs * progress_bar.n / args.max_train_steps,
+                    "total loss": loss.detach().item(),
+                    "implicit_acc": implicit_acc,
+                    "lr": lr_scheduler.get_last_lr()[0],
+                    "model_losses_w": model_losses_w.mean().detach().item(),
+                    "model_losses_l": model_losses_l.mean().detach().item(),
+                    "losses_diff": model_losses_w.mean().detach().item() - model_losses_l.mean().detach().item(),
+                    "ref_diff": ref_diff.mean().detach().item(),
+                }
+                implicit_acc_accumulated = 0.0
+            elif args.mapo_training:
+                logs = {
+                    "epoch": args.num_train_epochs * progress_bar.n / args.max_train_steps,
+                    "total loss": loss.detach().item(),
+                    "Win Score": ((args.snr_value * model_losses_w) / (torch.exp(args.snr_value * model_losses_w) - 1))
+                    .mean()
+                    .detach()
+                    .item(),
+                    "Lose Score": ((args.snr_value * model_losses_l) / (torch.exp(args.snr_value * model_losses_l) - 1))
+                    .mean()
+                    .detach()
+                    .item(),
+                    "lr": lr_scheduler.get_last_lr()[0],
+                    "OR loss": -ratio_losses.mean().detach().item(),
+                    "model_losses_w": model_losses_w.mean().detach().item(),
+                    "model_losses_l": model_losses_l.mean().detach().item(),
+                }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -561,3 +611,4 @@ def main(args):
 if __name__ == "__main__":
     args = parse_args()
     main(args)
+s

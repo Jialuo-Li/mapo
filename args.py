@@ -37,7 +37,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--dataset_split_name",
         type=str,
-        default="validation",
+        default="train",
         help="Dataset split to be used during training. Helpful to specify for conducting experimental runs.",
     )
     parser.add_argument(
@@ -92,7 +92,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--vae_encode_batch_size",
         type=int,
-        default=8,
+        default=1,
         help="Batch size to use for VAE encoding of the images for efficient processing.",
     )
     parser.add_argument(
@@ -159,6 +159,22 @@ def parse_args(input_args=None):
         type=float,
         default=0.1,
         help="ORPO contribution factor.",
+    )
+    parser.add_argument(
+        "--beta_dpo",
+        type=float,
+        default=5000,
+        help="DPO contribution factor.",
+    )
+    parser.add_argument(
+        "--dpo_training",
+        action="store_true",
+        help="Whether to use DPO training.",
+    )
+    parser.add_argument(
+        "--sft_training",
+        action="store_true",
+        help="Whether to use SFT training.",
     )
     parser.add_argument(
         "--label_noise_prob",
