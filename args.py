@@ -177,6 +177,11 @@ def parse_args(input_args=None):
         help="Whether to use SFT training.",
     )
     parser.add_argument(
+        "--mapo_training",
+        action="store_true",
+        help="Whether to use MAPO training.",
+    )
+    parser.add_argument(
         "--label_noise_prob",
         type=float,
         default=None,

@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch --multi_gpu train_with_lora.py \
+CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 accelerate launch --multi_gpu train_with_lora.py \
   --pretrained_model_name_or_path=stabilityai/stable-diffusion-xl-base-1.0  \
   --pretrained_vae_model_name_or_path=madebyollin/sdxl-vae-fp16-fix \
   --output_dir="mapo" \
@@ -12,10 +12,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch --multi_gpu train_with_lo
   --learning_rate=1e-7 \
   --scale_lr \
   --lr_scheduler="constant_with_warmup" --lr_warmup_steps=400 \
-  --lr_warmup_steps=0 \
   --max_train_steps=2000 \
   --checkpointing_steps=500 \
   --seed="0" \
   --beta_mapo=0.05 \
   --run_validation --validation_steps=50 \
-  --report_to="wandb"
+  --report_to="wandb" \
+  --mapo_training
+  # --resume_from_checkpoint="latest"

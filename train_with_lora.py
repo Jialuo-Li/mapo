@@ -540,8 +540,7 @@ def main(args):
                     "lr": lr_scheduler.get_last_lr()[0],
                     "model_losses_w": model_losses_w.mean().detach().item(),
                     "model_losses_l": model_losses_l.mean().detach().item(),
-                    "losses_diff": model_losses_w.mean().detach().item() - model_losses_l.mean().detach().item(),
-                    "ref_diff": ref_diff.mean().detach().item(),
+                    "losses_diff-ref_diff": model_losses_w.mean().detach().item() - model_losses_l.mean().detach().item() - ref_diff.mean().detach().item(),
                 }
                 implicit_acc_accumulated = 0.0
             elif args.mapo_training:
@@ -611,4 +610,3 @@ def main(args):
 if __name__ == "__main__":
     args = parse_args()
     main(args)
-s
