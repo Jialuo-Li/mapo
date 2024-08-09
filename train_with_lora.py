@@ -42,6 +42,7 @@ from diffusers import (
 from diffusers.loaders import StableDiffusionXLLoraLoaderMixin
 from diffusers.optimization import get_scheduler
 from diffusers.utils import convert_state_dict_to_diffusers, convert_unet_state_dict_to_peft
+from diffusers.training_utils import _set_state_dict_into_text_encoder
 from utils import (
     collate_fn,
     compute_loss,
@@ -53,7 +54,7 @@ from utils import (
     log_validation,
     compute_dpo_loss
 )
-
+import datetime
 
 logger = get_logger(__name__)
 
@@ -61,9 +62,8 @@ logger = get_logger(__name__)
 def main(args):
     if args.lora_rank is None:
         raise ValueError("`--lora_rank` cannot be undefined when using LoRA training.")
-
+    id = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     logging_dir = Path(args.output_dir, args.logging_dir)
-
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     accelerator = Accelerator(
@@ -179,22 +179,48 @@ def main(args):
     vae.to(accelerator.device, dtype=torch.float32)
 
     # Set up LoRA.
-    unet_lora_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_rank,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-    )
-    # Add adapter and make sure the trainable params are in float32.
-    unet.add_adapter(unet_lora_config)
+    if args.train_unet:
+        unet_lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_rank,
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        )
+        # Add adapter and make sure the trainable params are in float32.
+        unet.add_adapter(unet_lora_config)
+    
+    if args.train_text_encoder:
+        # ensure that dtype is float32, even if rest of the model that isn't trained is loaded in fp16
+        text_lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_rank,
+            init_lora_weights="gaussian",
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+        )
+        text_encoder_one.add_adapter(text_lora_config)
+        text_encoder_two.add_adapter(text_lora_config)
+    
     if args.mixed_precision == "fp16":
-        for param in unet.parameters():
-            # only upcast trainable parameters (LoRA) into fp32
-            if param.requires_grad:
-                param.data = param.to(torch.float32)
+        # only upcast trainable parameters (LoRA) into fp32
+        if args.train_unet:
+            for param in unet.parameters():
+                if param.requires_grad:
+                    param.data = param.to(torch.float32)
+
+        if args.train_text_encoder:
+            for param in text_encoder_one.parameters():
+                if param.requires_grad:
+                    param.data = param.to(torch.float32)
+            for param in text_encoder_two.parameters():
+                if param.requires_grad:
+                    param.data = param.to(torch.float32)
 
     if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+        if args.train_unet:
+            unet.enable_gradient_checkpointing()
+        if args.train_text_encoder:
+            text_encoder_one.enable_gradient_checkpointing()
+            text_encoder_two.enable_gradient_checkpointing()
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
@@ -202,10 +228,16 @@ def main(args):
             # there are only two options here. Either are just the unet attn processor layers
             # or there are the unet and text encoder atten layers
             unet_lora_layers_to_save = None
+            text_encoder_one_lora_layers_to_save = None
+            text_encoder_two_lora_layers_to_save = None
 
             for model in models:
                 if isinstance(model, type(accelerator.unwrap_model(unet))):
                     unet_lora_layers_to_save = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
+                elif isinstance(model, type(accelerator.unwrap_model(text_encoder_one))):
+                    text_encoder_one_lora_layers_to_save = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
+                elif isinstance(model, type(accelerator.unwrap_model(text_encoder_two))):
+                    text_encoder_two_lora_layers_to_save = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
                 else:
                     raise ValueError(f"unexpected save model: {model.__class__}")
 
@@ -215,34 +247,46 @@ def main(args):
             StableDiffusionXLLoraLoaderMixin.save_lora_weights(
                 output_dir,
                 unet_lora_layers=unet_lora_layers_to_save,
-                text_encoder_lora_layers=None,
-                text_encoder_2_lora_layers=None,
+                text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
+                text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
             )
 
     def load_model_hook(models, input_dir):
         unet_ = None
-
+        text_encoder_one_ = None
+        text_encoder_two_ = None
+        
         while len(models) > 0:
             model = models.pop()
 
             if isinstance(model, type(accelerator.unwrap_model(unet))):
                 unet_ = model
+            elif isinstance(model, type(accelerator.unwrap_model(text_encoder_one))):
+                text_encoder_one_ = model
+            elif isinstance(model, type(accelerator.unwrap_model(text_encoder_two))):
+                text_encoder_two_ = model
             else:
                 raise ValueError(f"unexpected save model: {model.__class__}")
 
         lora_state_dict, network_alphas = StableDiffusionXLLoraLoaderMixin.lora_state_dict(input_dir)
+        if args.train_unet:
+            unet_state_dict = {f'{k.replace("unet.", "")}': v for k, v in lora_state_dict.items() if k.startswith("unet.")}
+            unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
+            incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
+            if incompatible_keys is not None:
+                # check only for unexpected keys
+                unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+                if unexpected_keys:
+                    logger.warning(
+                        f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
+                        f" {unexpected_keys}. "
+                    )
+        if args.train_text_encoder:
+            _set_state_dict_into_text_encoder(lora_state_dict, prefix="text_encoder.", text_encoder=text_encoder_one_)
 
-        unet_state_dict = {f'{k.replace("unet.", "")}': v for k, v in lora_state_dict.items() if k.startswith("unet.")}
-        unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
-        incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
-        if incompatible_keys is not None:
-            # check only for unexpected keys
-            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-            if unexpected_keys:
-                logger.warning(
-                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                    f" {unexpected_keys}. "
-                )
+            _set_state_dict_into_text_encoder(
+                lora_state_dict, prefix="text_encoder_2.", text_encoder=text_encoder_two_
+            )
 
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
@@ -271,7 +315,13 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
-    params_to_optimize = list(filter(lambda p: p.requires_grad, unet.parameters()))
+    params_to_optimize = []
+    if args.train_unet:
+        params_to_optimize += list(filter(lambda p: p.requires_grad, unet.parameters()))
+    if args.train_text_encoder:
+        params_to_optimize += list(filter(lambda p: p.requires_grad, text_encoder_one.parameters()))
+        params_to_optimize += list(filter(lambda p: p.requires_grad, text_encoder_two.parameters()))
+        
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
@@ -316,10 +366,19 @@ def main(args):
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
-
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
-    )
+    
+    if args.train_unet and args.train_text_encoder:
+        unet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler
+        )
+    elif args.train_unet:
+        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, optimizer, train_dataloader, lr_scheduler
+        )
+    elif args.train_text_encoder:
+        text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler
+        )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -381,8 +440,12 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-
-    unet.train()
+    
+    if args.train_unet:
+        unet.train()
+    if args.train_text_encoder:
+        text_encoder_one.train()
+        text_encoder_two.train()
     implicit_acc_accumulated = 0.0
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -518,7 +581,7 @@ def main(args):
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(os.path.join(args.output_dir, id), f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 

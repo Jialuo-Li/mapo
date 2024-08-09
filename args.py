@@ -182,6 +182,16 @@ def parse_args(input_args=None):
         help="Whether to use MAPO training.",
     )
     parser.add_argument(
+        "--train_text_encoder",
+        action="store_true",
+        help="Whether to train text encoder.",
+    )
+    parser.add_argument(
+        "--train_unet",
+        action="store_true",
+        help="Whether to train unet.",
+    )
+    parser.add_argument(
         "--label_noise_prob",
         type=float,
         default=None,

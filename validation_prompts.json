@@ -3,10 +3,16 @@
         "A realistic scene of a pen in a simple space without gravity",
         "A realistic scene of a book in a simple space without gravity",
         "A realistic scene of a bottle in a simple space without gravity",
-        "A realistic scene of a desk in a simple space without gravity"
+        "A realistic scene of a desk in a simple space without gravity",
+        "A realistic scene of a pen floating in the air within an simple space",
+        "A realistic scene of a book floating in the air within an simple space",
+        "A realistic scene of a bottle floating in the air within an simple space",
+        "A realistic scene of a desk floating in the air within an simple space"
     ],
     "EVAL_PROMPTS": [
         "A realistic scene of a clock in a simple space without gravity",
-        "A realistic scene of a laptop in a simple space without gravity"
+        "A realistic scene of a laptop in a simple space without gravity",
+        "A realistic scene of a clock floating in the air within an simple space",
+        "A realistic scene of a laptop floating in the air within an simple space"
     ]
 }

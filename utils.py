@@ -142,9 +142,9 @@ def log_validation(args, unet, vae, accelerator, weight_dtype, epoch, is_final_v
 
 
 # Tokenizing captions (c)
-def tokenize_captions(tokenizers, examples):
+def tokenize_captions(tokenizers, example_captions):
     captions = []
-    for caption in examples["caption"]:
+    for caption in example_captions:
         captions.append(caption)
 
     tokens_one = tokenizers[0](
@@ -214,7 +214,6 @@ def get_dataset_preprocessor(args, tokenizer_one, tokenizer_two):
         im_tup_iterator = zip(*all_pixel_values)
         combined_pixel_values = []
         for im_tup, caption in zip(im_tup_iterator, examples["caption"]):
-            # Label noise.
 
             combined_im = torch.cat(im_tup, dim=0)  # no batch dim
 
@@ -242,7 +241,7 @@ def get_dataset_preprocessor(args, tokenizer_one, tokenizer_two):
         examples["pixel_values"] = combined_pixel_values
         examples["original_sizes"] = original_sizes
         examples["crop_top_lefts"] = crop_top_lefts
-        tokens_one, tokens_two = tokenize_captions([tokenizer_one, tokenizer_two], examples)
+        tokens_one, tokens_two = tokenize_captions([tokenizer_one, tokenizer_two], examples['caption_rewrited_positive'])
         examples["input_ids_one"] = tokens_one
         examples["input_ids_two"] = tokens_two
         return examples
