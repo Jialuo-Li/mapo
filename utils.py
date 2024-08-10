@@ -241,7 +241,7 @@ def get_dataset_preprocessor(args, tokenizer_one, tokenizer_two):
         examples["pixel_values"] = combined_pixel_values
         examples["original_sizes"] = original_sizes
         examples["crop_top_lefts"] = crop_top_lefts
-        tokens_one, tokens_two = tokenize_captions([tokenizer_one, tokenizer_two], examples['caption_rewrited_positive'])
+        tokens_one, tokens_two = tokenize_captions([tokenizer_one, tokenizer_two], examples['caption'])
         examples["input_ids_one"] = tokens_one
         examples["input_ids_two"] = tokens_two
         return examples

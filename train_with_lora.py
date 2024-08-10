@@ -449,7 +449,11 @@ def main(args):
     implicit_acc_accumulated = 0.0
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet):
+            if args.train_text_encoder:
+                model_accum = [text_encoder_one, text_encoder_two]
+            if args.train_unet:
+                model_accum = unet
+            with accelerator.accumulate(model_accum):
                 # (batch_size, 2*channels, h, w) -> (2*batch_size, channels, h, w)
                 idx1 = random.randint(0, batch["pixel_values"].shape[1] // 6 - 1)
                 value_w = batch["pixel_values"][:, idx1 * 3 : (idx1 + 1) * 3, :, :].to(dtype=vae.dtype)
