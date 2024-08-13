@@ -24,7 +24,7 @@ import torch
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration, set_seed, DistributedDataParallelKwargs
 from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from peft import LoraConfig, set_peft_model_state_dict
@@ -62,15 +62,15 @@ logger = get_logger(__name__)
 def main(args):
     if args.lora_rank is None:
         raise ValueError("`--lora_rank` cannot be undefined when using LoRA training.")
-    id = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-
+    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
+        kwargs_handlers=[kwargs],
     )
 
     # Disable AMP for MPS.
@@ -151,10 +151,20 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
     if args.dpo_training:
-        ref_unet = UNet2DConditionModel.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
-        )
-        ref_unet.requires_grad_(False)
+        if args.train_unet:
+            ref_unet = UNet2DConditionModel.from_pretrained(
+                args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+            )
+            ref_unet.requires_grad_(False)
+        if args.train_text_encoder:
+            ref_text_encoder_one = text_encoder_cls_one.from_pretrained(
+                args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+            )
+            ref_text_encoder_two = text_encoder_cls_two.from_pretrained(
+                args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
+            )
+            ref_text_encoder_one.requires_grad_(False)
+            ref_text_encoder_two.requires_grad_(False)
     # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
@@ -171,7 +181,12 @@ def main(args):
     # Move unet and text_encoders to device and cast to weight_dtype
     unet.to(accelerator.device, dtype=weight_dtype)
     if args.dpo_training:
-        ref_unet.to(accelerator.device, dtype=weight_dtype)
+        if args.train_unet:
+            ref_unet.to(accelerator.device, dtype=weight_dtype)
+        if args.train_text_encoder:
+            ref_text_encoder_one.to(accelerator.device, dtype=weight_dtype)
+            ref_text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+    
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
@@ -509,9 +524,17 @@ def main(args):
                 prompt_embeds, pooled_prompt_embeds = encode_prompt(
                     [text_encoder_one, text_encoder_two], [batch["input_ids_one"], batch["input_ids_two"]]
                 )
+                
                 if args.dpo_training or args.mapo_training:
                     prompt_embeds = prompt_embeds.repeat(2, 1, 1)
                     pooled_prompt_embeds = pooled_prompt_embeds.repeat(2, 1)
+                    
+                if args.dpo_training and args.train_text_encoder:
+                    ref_prompt_embeds, ref_pooled_prompt_embeds = encode_prompt(
+                        [ref_text_encoder_one, ref_text_encoder_two], [batch["input_ids_one"], batch["input_ids_two"]]
+                    )
+                    ref_prompt_embeds = ref_prompt_embeds.repeat(2, 1, 1)
+                    ref_pooled_prompt_embeds = ref_pooled_prompt_embeds.repeat(2, 1)
 
                 # Predict the noise residual
                 with accelerator.autocast():
@@ -522,12 +545,27 @@ def main(args):
                         added_cond_kwargs={"time_ids": add_time_ids, "text_embeds": pooled_prompt_embeds},
                     ).sample
                     if args.dpo_training:
-                        ref_pred = ref_unet(
-                            noisy_model_input,
-                            timesteps,
-                            prompt_embeds,
-                            added_cond_kwargs={"time_ids": add_time_ids, "text_embeds": pooled_prompt_embeds},
-                        ).sample
+                        if args.train_unet and args.train_text_encoder:
+                            ref_pred = ref_unet(
+                                noisy_model_input,
+                                timesteps,
+                                ref_prompt_embeds,
+                                added_cond_kwargs={"time_ids": add_time_ids, "text_embeds": ref_pooled_prompt_embeds},
+                            ).sample
+                        elif args.train_unet:
+                            ref_pred = ref_unet(
+                                noisy_model_input,
+                                timesteps,
+                                prompt_embeds,
+                                added_cond_kwargs={"time_ids": add_time_ids, "text_embeds": pooled_prompt_embeds},
+                            ).sample
+                        elif args.train_text_encoder:
+                            ref_pred = unet(
+                                noisy_model_input,
+                                timesteps,
+                                ref_prompt_embeds,
+                                added_cond_kwargs={"time_ids": add_time_ids, "text_embeds": ref_pooled_prompt_embeds},
+                            ).sample
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
@@ -550,10 +588,14 @@ def main(args):
                     )
                 else:
                     ValueError("Unknown training type")
+                # loss = loss / args.gradient_accumulation_steps
+                
                 # Backprop.
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
+                
+                # if (step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -585,13 +627,13 @@ def main(args):
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(os.path.join(args.output_dir, id), f"checkpoint-{global_step}")
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
                     if args.run_validation and global_step % args.validation_steps == 0:
                         log_validation(
-                            args, unet=unet, vae=vae, accelerator=accelerator, weight_dtype=weight_dtype, epoch=epoch
+                            args, unet=unet, vae=vae, text_encoder_one=text_encoder_one, text_encoder_two=text_encoder_two, accelerator=accelerator, weight_dtype=weight_dtype, epoch=epoch
                         )
             if args.sft_training:
                 logs = {
@@ -636,15 +678,27 @@ def main(args):
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unet = accelerator.unwrap_model(unet)
-        unet = unet.to(torch.float32)
-        unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
+        if args.train_unet:
+            unet = accelerator.unwrap_model(unet)
+            unet = unet.to(torch.float32)
+            unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
+        else:
+            unet_lora_state_dict = None
+        if args.train_text_encoder:
+            text_encoder_one = accelerator.unwrap_model(text_encoder_one)
+            text_encoder_two = accelerator.unwrap_model(text_encoder_two)
 
+            text_encoder_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder_one))
+            text_encoder_2_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder_two))
+        else:
+            text_encoder_lora_layers = None
+            text_encoder_2_lora_layers = None
+            
         StableDiffusionXLLoraLoaderMixin.save_lora_weights(
             save_directory=args.output_dir,
             unet_lora_layers=unet_lora_state_dict,
-            text_encoder_lora_layers=None,
-            text_encoder_2_lora_layers=None,
+            text_encoder_lora_layers=text_encoder_lora_layers,
+            text_encoder_2_lora_layers=text_encoder_2_lora_layers,
         )
 
         # Final validation?
@@ -653,6 +707,8 @@ def main(args):
                 args,
                 unet=None,
                 vae=vae,
+                text_encoder_one=None,
+                text_encoder_two=None,
                 accelerator=accelerator,
                 weight_dtype=weight_dtype,
                 epoch=epoch,

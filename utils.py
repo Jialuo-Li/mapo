@@ -46,7 +46,7 @@ def import_model_class_from_model_name_or_path(
 
 
 # Logging validations during training
-def log_validation(args, unet, vae, accelerator, weight_dtype, epoch, is_final_validation=False):
+def log_validation(args, unet, vae, text_encoder_one, text_encoder_two, accelerator, weight_dtype, epoch, is_final_validation=False):
     logger.info(f"Running validation... \n Generating images with prompts:\n" f" {VALIDATION_PROMPTS}.")
 
     if is_final_validation:
@@ -63,12 +63,13 @@ def log_validation(args, unet, vae, accelerator, weight_dtype, epoch, is_final_v
     )
     if not is_final_validation:
         pipeline.unet = accelerator.unwrap_model(unet)
+        pipeline.text_encoder = accelerator.unwrap_model(text_encoder_one)
+        pipeline.text_encoder_2 = accelerator.unwrap_model(text_encoder_two)
     else:
         if args.lora_rank is not None:
             pipeline.load_lora_weights(args.output_dir, weight_name="pytorch_lora_weights.safetensors")
         else:
-            unet = UNet2DConditionModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
-            pipeline.unet = unet
+            ValueError("LoRA rank must be provided for final validation.")
 
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
@@ -106,16 +107,7 @@ def log_validation(args, unet, vae, accelerator, weight_dtype, epoch, is_final_v
         if args.lora_rank is not None:
             pipeline.disable_lora()
         else:
-            del pipeline
-            # We reinitialize the pipeline here with the pre-trained UNet.
-            pipeline = DiffusionPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                vae=vae,
-                revision=args.revision,
-                variant=args.variant,
-                torch_dtype=weight_dtype,
-            ).to(accelerator.device)
-            pipeline.set_progress_bar_config(disable=True)
+            ValueError("LoRA rank must be provided for final validation.")
 
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
         no_lora_images = [
@@ -157,7 +149,7 @@ def tokenize_captions(tokenizers, example_captions):
     return tokens_one, tokens_two
 
 
-@torch.no_grad()
+# @torch.no_grad()
 def encode_prompt(text_encoders, text_input_ids_list):
     prompt_embeds_list = []
 
