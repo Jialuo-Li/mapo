@@ -1,7 +1,7 @@
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --multi_gpu train_with_lora.py \
   --pretrained_model_name_or_path=stabilityai/stable-diffusion-xl-base-1.0  \
   --pretrained_vae_model_name_or_path=madebyollin/sdxl-vae-fp16-fix \
-  --output_dir="mapo" \
+  --output_dir="mapo_positive_caption_text" \
   --mixed_precision="fp16" \
   --dataset_name=Jialuo21/Phys_data \
   --train_batch_size=2 \
@@ -18,6 +18,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --multi_gpu train_with_lora.py \
   --beta_mapo=0.05 \
   --run_validation --validation_steps=50 \
   --report_to="wandb" \
-  --train_unet
+  --train_text_encoder
+#   --train_unet
   # --resume_from_checkpoint="latest"
   # --gradient_checkpointing 

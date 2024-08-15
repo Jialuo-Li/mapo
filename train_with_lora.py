@@ -150,7 +150,7 @@ def main(args):
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
-    if args.dpo_training:
+    if args.dpo_training or args.sft_training:
         if args.train_unet:
             ref_unet = UNet2DConditionModel.from_pretrained(
                 args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
@@ -180,7 +180,7 @@ def main(args):
 
     # Move unet and text_encoders to device and cast to weight_dtype
     unet.to(accelerator.device, dtype=weight_dtype)
-    if args.dpo_training:
+    if args.dpo_training or args.sft_training:
         if args.train_unet:
             ref_unet.to(accelerator.device, dtype=weight_dtype)
         if args.train_text_encoder:
@@ -529,12 +529,13 @@ def main(args):
                     prompt_embeds = prompt_embeds.repeat(2, 1, 1)
                     pooled_prompt_embeds = pooled_prompt_embeds.repeat(2, 1)
                     
-                if args.dpo_training and args.train_text_encoder:
+                if (args.dpo_training or args.sft_training) and args.train_text_encoder:
                     ref_prompt_embeds, ref_pooled_prompt_embeds = encode_prompt(
                         [ref_text_encoder_one, ref_text_encoder_two], [batch["input_ids_one"], batch["input_ids_two"]]
                     )
-                    ref_prompt_embeds = ref_prompt_embeds.repeat(2, 1, 1)
-                    ref_pooled_prompt_embeds = ref_pooled_prompt_embeds.repeat(2, 1)
+                    if args.dpo_training:
+                        ref_prompt_embeds = ref_prompt_embeds.repeat(2, 1, 1)
+                        ref_pooled_prompt_embeds = ref_pooled_prompt_embeds.repeat(2, 1)
 
                 # Predict the noise residual
                 with accelerator.autocast():
@@ -544,7 +545,7 @@ def main(args):
                         prompt_embeds,
                         added_cond_kwargs={"time_ids": add_time_ids, "text_embeds": pooled_prompt_embeds},
                     ).sample
-                    if args.dpo_training:
+                    if args.dpo_training or args.sft_training:
                         if args.train_unet and args.train_text_encoder:
                             ref_pred = ref_unet(
                                 noisy_model_input,
@@ -576,8 +577,9 @@ def main(args):
 
                 if args.sft_training:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    loss_ref = F.mse_loss(ref_pred.float(), target.float(), reduction="mean")
                 elif args.dpo_training:
-                    loss, model_losses_w, model_losses_l, implicit_acc, ref_diff = compute_dpo_loss(
+                    loss, model_losses_w, model_losses_l, implicit_acc, ref_losses_w, ref_losses_l = compute_dpo_loss(
                         args=args, model_pred=model_pred, target=target, ref_pred=ref_pred
                     )
                     avg_acc = accelerator.gather(implicit_acc).mean().detach().item()
@@ -640,6 +642,7 @@ def main(args):
                     "epoch": args.num_train_epochs * progress_bar.n / args.max_train_steps,
                     "total loss": loss.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0],
+                    "loss_ref": loss_ref.detach().item(),
                 }
             elif args.dpo_training:
                 logs = {
@@ -649,21 +652,16 @@ def main(args):
                     "lr": lr_scheduler.get_last_lr()[0],
                     "model_losses_w": model_losses_w.mean().detach().item(),
                     "model_losses_l": model_losses_l.mean().detach().item(),
-                    "losses_diff-ref_diff": model_losses_w.mean().detach().item() - model_losses_l.mean().detach().item() - ref_diff.mean().detach().item(),
+                    "losses_diff_w": model_losses_w.mean().detach().item() - ref_losses_w.mean().detach().item(),
+                    "losses_diff_l": model_losses_l.mean().detach().item() - ref_losses_l.mean().detach().item(),
                 }
                 implicit_acc_accumulated = 0.0
             elif args.mapo_training:
                 logs = {
                     "epoch": args.num_train_epochs * progress_bar.n / args.max_train_steps,
                     "total loss": loss.detach().item(),
-                    "Win Score": ((args.snr_value * model_losses_w) / (torch.exp(args.snr_value * model_losses_w) - 1))
-                    .mean()
-                    .detach()
-                    .item(),
-                    "Lose Score": ((args.snr_value * model_losses_l) / (torch.exp(args.snr_value * model_losses_l) - 1))
-                    .mean()
-                    .detach()
-                    .item(),
+                    "Win Score": ((args.snr_value * model_losses_w) / (torch.exp(args.snr_value * model_losses_w) - 1)).mean().detach().item(),
+                    "Lose Score": ((args.snr_value * model_losses_l) / (torch.exp(args.snr_value * model_losses_l) - 1)).mean().detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0],
                     "OR loss": -ratio_losses.mean().detach().item(),
                     "model_losses_w": model_losses_w.mean().detach().item(),

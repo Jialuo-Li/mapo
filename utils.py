@@ -233,7 +233,7 @@ def get_dataset_preprocessor(args, tokenizer_one, tokenizer_two):
         examples["pixel_values"] = combined_pixel_values
         examples["original_sizes"] = original_sizes
         examples["crop_top_lefts"] = crop_top_lefts
-        tokens_one, tokens_two = tokenize_captions([tokenizer_one, tokenizer_two], examples['caption'])
+        tokens_one, tokens_two = tokenize_captions([tokenizer_one, tokenizer_two], examples['caption_rewrited_positive'])
         examples["input_ids_one"] = tokens_one
         examples["input_ids_two"] = tokens_two
         return examples
@@ -301,4 +301,4 @@ def compute_dpo_loss(args, model_pred, target, ref_pred):
     implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
     loss = -1 * F.logsigmoid(inside_term).mean()
     
-    return loss, model_losses_w, model_losses_l, implicit_acc, ref_diff
+    return loss, model_losses_w, model_losses_l, implicit_acc, ref_losses_w, ref_losses_l
